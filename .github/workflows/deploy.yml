@@ -1,0 +1,88 @@
+name: Build & Deploy (EC2 via Docker)
+
+on:
+  push:
+    branches: [ "main" ]  # change if you deploy from another branch
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write  # needed to push to GHCR
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node (for tests/lint - optional)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Optional: run your tests
+      # - run: npm ci && npm test
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      # --- Deploy to EC2 via SSH and Docker Compose
+      - name: Deploy on EC2 (pull & restart)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}     # e.g. ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}       # your PEM private key
+          script_stop: true
+          script: |
+            set -e
+            mkdir -p ~/app
+            cat > ~/app/docker-compose.yml <<'EOF'
+            services:
+              web:
+                image: ${{ env.IMAGE_NAME }}:latest
+                restart: unless-stopped
+                env_file:
+                  - .env
+                ports:
+                  - "80:3000"
+                healthcheck:
+                  test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+                  interval: 30s
+                  timeout: 3s
+                  start_period: 10s
+            EOF
+
+            # Create .env if not present; edit it manually with real values
+            if [ ! -f ~/app/.env ]; then
+              cat > ~/app/.env <<'EOF'
+            NODE_ENV=production
+            PORT=3000
+            # add your DATABASE_URL, JWT_SECRET, etc.
+            EOF
+            fi
+
+            # Pull latest & run
+            docker pull ${{ env.IMAGE_NAME }}:latest || true
+            cd ~/app
+            docker compose up -d --pull always --remove-orphans
